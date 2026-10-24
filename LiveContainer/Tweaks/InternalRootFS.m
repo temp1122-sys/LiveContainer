@@ -12,7 +12,6 @@
 
 #import "Tweaks.h"
 #import "../LCSharedUtils.h"
-#import "../utils.h"
 #include "../../litehook/src/litehook.h"
 
 #include <dirent.h>
@@ -27,6 +26,15 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
+
+// InternalRootFS only needs LiveContainer's preserved host bundle accessor.
+// Do not import utils.h here: that header pulls in unrelated low-level
+// declarations (including audit-token types) that are not part of this target's
+// normal include environment. The method is implemented by LiveContainer at
+// runtime; Objective-C dispatch does not require the full category header.
+@interface NSUserDefaults (InternalRootFSHostBundle)
++ (NSBundle *)lcMainBundle;
+@end
 
 static bool gInternalRootFSEnabled = false;
 static char gInternalRootFSPath[PATH_MAX] = {0};
