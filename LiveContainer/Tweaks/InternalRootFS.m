@@ -94,6 +94,10 @@ const char *InternalRootFSTranslatePath(const char *path, char *buffer, size_t b
     if (!force && !overlay) {
         return path;
     }
+    
+    if (gInternalRootFSLogCount < 250) {
+        NSLog(@"[InternalRootFS] lookup: %s", path);
+    }
 
     // /etc on iOS resolves into /private/etc. Preserve the on-disk root layout
     // when looking inside an extracted filesystem image.
@@ -213,9 +217,58 @@ static char *irfs_realpath(const char *path, char *resolvedPath) {
     return irfs_orig_realpath(InternalRootFSTranslatePath(path, translated, sizeof(translated)), resolvedPath);
 }
 
-static void *irfs_dlopen(const char *path, int mode) {
+static void irfs_self_test(void) {
+    NSLog(@"[InternalRootFS] ===== self-test =====");
+    NSLog(@"[InternalRootFS] root = %s", gInternalRootFSPath);
+
+    const char *testVirtualPath =
+        "/AppleInternal/Library/Frameworks/"
+        "CoreAutomationDevice.framework/CoreAutomationDevice";
+
+    char translated[PATH_MAX];
+    const char *resolved = InternalRootFSTranslatePath(
+        testVirtualPath,
+        translated,
+        sizeof(translated)
+    );
+
+    NSLog(@"[InternalRootFS] virtual path = %s", testVirtualPath);
+    NSLog(@"[InternalRootFS] resolved path = %s", resolved);
+
+    struct stat st;
+    int rc = irfs_orig_stat(resolved, &st);
+
+    if (rc == 0) {
+        NSLog(@"[InternalRootFS] SELF-TEST HIT");
+        NSLog(@"[InternalRootFS] size = %lld", (long long)st.st_size);
+        NSLog(@"[InternalRootFS] mode = %o", st.st_mode);
+    } else {
+        NSLog(@"[InternalRootFS] SELF-TEST MISS errno=%d (%s)",
+              errno, strerror(errno));
+    }
+
+    NSLog(@"[InternalRootFS] ===================");
+}
+
+/* static void *irfs_dlopen(const char *path, int mode) {
     char translated[PATH_MAX];
     const char *resolved = InternalRootFSTranslatePath(path, translated, sizeof(translated));
+    return irfs_orig_dlopen(resolved, mode);
+} */
+
+static void *irfs_dlopen(const char *path, int mode) {
+    NSLog(@"[InternalRootFS] dlopen request: %s",
+          path ? path : "(null)");
+
+    char translated[PATH_MAX];
+    const char *resolved =
+        InternalRootFSTranslatePath(path, translated, sizeof(translated));
+
+    if (path && resolved && strcmp(path, resolved) != 0) {
+        NSLog(@"[InternalRootFS] dlopen translated: %s -> %s",
+              path, resolved);
+    }
+
     return irfs_orig_dlopen(resolved, mode);
 }
 
@@ -270,4 +323,5 @@ void InternalRootFSInit(const char *rootPath) {
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlopen, irfs_dlopen, nil);
 
     NSLog(@"[InternalRootFS] enabled read-only compatibility root: %s", gInternalRootFSPath);
+    irfs_self_test();
 }
