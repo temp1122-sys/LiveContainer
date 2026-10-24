@@ -12,6 +12,7 @@
 #include "mach_excServer.h"
 #import "../utils.h"
 #import "../dyld_bypass_validation.h"
+#import "Tweaks.h"
 @import Darwin;
 @import Foundation;
 @import MachO;
@@ -595,16 +596,19 @@ void *jitless_hook_dlopen(const char *path, int mode) {
     hookDebugState.__bcr[0] = 0x1e5;
     thread_set_state(thread, ARM_DEBUG_STATE64, (thread_state_t)&hookDebugState, ARM_DEBUG_STATE64_COUNT);
     
-    // fixup @loader_path since we cannot use musttail here
+    // First map absolute AppleInternal/Developer paths into the optional
+    // compatibility root, then preserve LiveContainer's @loader_path fixup.
     void *result;
+    char internalRootResolvedPath[PATH_MAX];
+    const char *pathToLoad = InternalRootFSTranslatePath(path, internalRootResolvedPath, sizeof(internalRootResolvedPath));
     void *callerAddr = __builtin_return_address(0);
     struct dl_info info;
-    if (path && !strncmp(path, "@loader_path/", 13) && dladdr(callerAddr, &info)) {
+    if (pathToLoad && !strncmp(pathToLoad, "@loader_path/", 13) && dladdr(callerAddr, &info)) {
         char resolvedPath[PATH_MAX];
-        snprintf(resolvedPath, sizeof(resolvedPath), "%s/%s", dirname((char *)info.dli_fname), path + 13);
+        snprintf(resolvedPath, sizeof(resolvedPath), "%s/%s", dirname((char *)info.dli_fname), pathToLoad + 13);
         result = orig_dlopen(resolvedPath, mode);
     } else {
-        result = orig_dlopen(path, mode);
+        result = orig_dlopen(pathToLoad, mode);
     }
     
     // restore old thread states

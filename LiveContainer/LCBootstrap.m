@@ -298,6 +298,14 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     if(!guestAppInfo) {
         return @"App bundle not found! Unable to read LCAppInfo.plist.";
     }
+
+    // AppleInternal compatibility PoC. Drop an extracted filesystem at:
+    //   LiveContainer/Documents/AppleInternalRootFS/
+    // with AppleInternal/, Developer/, System/, usr/, ... directly inside it.
+    // Presence of the folder enables the read-only overlay automatically.
+    // Rename/remove the folder to disable it.
+    NSString *internalRootFSPath = [docPath stringByAppendingPathComponent:@"AppleInternalRootFS"];
+    InternalRootFSInit(internalRootFSPath.fileSystemRepresentation);
     
     if([guestAppInfo[@"doUseLCBundleId"] boolValue] ) {
         NSMutableDictionary* infoPlist = [NSMutableDictionary dictionaryWithContentsOfFile:[NSString stringWithFormat:@"%@/Info.plist", bundlePath]];

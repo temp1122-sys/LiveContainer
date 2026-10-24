@@ -16,6 +16,11 @@ void NSURLSCGuestHooksInit(void);
 void initDead10ccFix(void);
 void IDFVHookInit(NSUUID* uuid);
 
+// AppleInternal filesystem compatibility PoC.
+void InternalRootFSInit(const char *rootPath);
+bool InternalRootFSEnabled(void);
+const char *InternalRootFSTranslatePath(const char *path, char *buffer, size_t bufferSize);
+
 @interface NSBundle(LiveContainer)
 - (instancetype)initWithPathForMainBundle:(NSString *)path;
 @end
