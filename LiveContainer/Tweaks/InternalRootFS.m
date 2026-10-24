@@ -262,7 +262,7 @@ static bool irfs_preloadable_file_exists(const char *path) {
     return irfs_orig_stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
-static bool irfs_path_is_mutable_internal_image(const char *path) {
+/* static bool irfs_path_is_mutable_internal_image(const char *path) {
     if (!path || !gInternalRootFSPath[0]) return false;
 
     char appleInternalRoot[PATH_MAX];
@@ -272,6 +272,33 @@ static bool irfs_path_is_mutable_internal_image(const char *path) {
 
     return irfs_has_prefix(path, appleInternalRoot) ||
            irfs_has_prefix(path, developerRoot);
+} */
+
+static bool irfs_path_is_mutable_internal_image(const char *path) {
+    if (!path || !gInternalRootFSPath[0]) return false;
+
+    char appleInternalRoot[PATH_MAX];
+    char developerRoot[PATH_MAX];
+    char usrLocalRoot[PATH_MAX];
+
+    snprintf(appleInternalRoot,
+             sizeof(appleInternalRoot),
+             "%s/AppleInternal",
+             gInternalRootFSPath);
+
+    snprintf(developerRoot,
+             sizeof(developerRoot),
+             "%s/Developer",
+             gInternalRootFSPath);
+
+    snprintf(usrLocalRoot,
+             sizeof(usrLocalRoot),
+             "%s/usr/local",
+             gInternalRootFSPath);
+
+    return irfs_has_prefix(path, appleInternalRoot) ||
+           irfs_has_prefix(path, developerRoot) ||
+           irfs_has_prefix(path, usrLocalRoot);
 }
 
 static bool irfs_dyld_error_is_signature_failure(const char *errorText) {
