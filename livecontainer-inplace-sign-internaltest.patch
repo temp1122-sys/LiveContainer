@@ -1,0 +1,637 @@
+diff --git a/LiveContainer.xcodeproj/project.pbxproj b/LiveContainer.xcodeproj/project.pbxproj
+index e5d705c..7fe82b5 100644
+--- a/LiveContainer.xcodeproj/project.pbxproj
++++ b/LiveContainer.xcodeproj/project.pbxproj
+@@ -1602,7 +1602,7 @@
+ 				);
+ 				GENERATE_INFOPLIST_FILE = NO;
+ 				INFOPLIST_FILE = LiveContainer/Info.plist;
+-				INFOPLIST_KEY_CFBundleDisplayName = LiveContainer;
++				INFOPLIST_KEY_CFBundleDisplayName = LiveContainerInternalTest;
+ 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+ 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
+ 				INFOPLIST_KEY_UIMainStoryboardFile = Main;
+@@ -1646,7 +1646,7 @@
+ 				);
+ 				GENERATE_INFOPLIST_FILE = NO;
+ 				INFOPLIST_FILE = LiveContainer/Info.plist;
+-				INFOPLIST_KEY_CFBundleDisplayName = LiveContainer;
++				INFOPLIST_KEY_CFBundleDisplayName = LiveContainerInternalTest;
+ 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
+ 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
+ 				INFOPLIST_KEY_UIMainStoryboardFile = Main;
+diff --git a/LiveContainer/Info.plist b/LiveContainer/Info.plist
+index 7ac555f..162a560 100644
+--- a/LiveContainer/Info.plist
++++ b/LiveContainer/Info.plist
+@@ -5,7 +5,7 @@
+ 	<key>CADisableMinimumFrameDurationOnPhone</key>
+ 	<true/>
+ 	<key>CFBundleDisplayName</key>
+-	<string>LiveContainer</string>
++	<string>LiveContainerInternalTest</string>
+ 	<key>CFBundleDocumentTypes</key>
+ 	<array>
+ 		<dict>
+@@ -30,7 +30,7 @@
+ 	<key>CFBundleInfoDictionaryVersion</key>
+ 	<string>6.0</string>
+ 	<key>CFBundleName</key>
+-	<string>LiveContainer</string>
++	<string>LiveContainerInternalTest</string>
+ 	<key>CFBundlePackageType</key>
+ 	<string>APPL</string>
+ 	<key>CFBundleShortVersionString</key>
+diff --git a/LiveContainer/Tweaks/InternalRootFS.m b/LiveContainer/Tweaks/InternalRootFS.m
+index dde0fc7..cc84401 100644
+--- a/LiveContainer/Tweaks/InternalRootFS.m
++++ b/LiveContainer/Tweaks/InternalRootFS.m
+@@ -11,6 +11,7 @@
+ @import Foundation;
+ 
+ #import "Tweaks.h"
++#import "../LCSharedUtils.h"
+ #include "../../litehook/src/litehook.h"
+ 
+ #include <dirent.h>
+@@ -18,6 +19,7 @@
+ #include <errno.h>
+ #include <fcntl.h>
+ #include <limits.h>
++#include <objc/message.h>
+ #include <stdarg.h>
+ #include <stdbool.h>
+ #include <stdio.h>
+@@ -251,6 +253,86 @@ static bool irfs_preloadable_file_exists(const char *path) {
+     return irfs_orig_stat(path, &st) == 0 && S_ISREG(st.st_mode);
+ }
+ 
++static bool irfs_path_is_mutable_internal_image(const char *path) {
++    if (!path || !gInternalRootFSPath[0]) return false;
++
++    char appleInternalRoot[PATH_MAX];
++    char developerRoot[PATH_MAX];
++    snprintf(appleInternalRoot, sizeof(appleInternalRoot), "%s/AppleInternal", gInternalRootFSPath);
++    snprintf(developerRoot, sizeof(developerRoot), "%s/Developer", gInternalRootFSPath);
++
++    return irfs_has_prefix(path, appleInternalRoot) ||
++           irfs_has_prefix(path, developerRoot);
++}
++
++static bool irfs_dyld_error_is_signature_failure(const char *errorText) {
++    if (!errorText) return false;
++    NSString *error = [[NSString stringWithUTF8String:errorText] lowercaseString];
++    if (!error.length) return false;
++
++    return [error containsString:@"code signature"] ||
++           [error containsString:@"signature invalid"] ||
++           [error containsString:@"invalid signature"] ||
++           [error containsString:@"ct policy"] ||
++           [error containsString:@"library validation"] ||
++           [error containsString:@"different team id"] ||
++           [error containsString:@"different team ids"];
++}
++
++// Load LiveContainer's embedded ZSign dylib, fetch the same developer
++// certificate LiveContainer already uses for guest apps, and sign the selected
++// RootFS Mach-O in place. The Mac-side archive is the pristine source; the
++// on-device RootFS is intentionally treated as a mutable execution copy.
++static bool irfs_sign_internal_image_in_place(const char *path) {
++    if (!path || !irfs_path_is_mutable_internal_image(path)) {
++        NSLog(@"[InternalRootFS] SIGN REFUSED outside mutable Internal roots: %s", path ?: "(null)");
++        return false;
++    }
++
++    NSString *password = [LCSharedUtils certificatePassword];
++    NSUserDefaults *defaults = [[NSUserDefaults alloc] initWithSuiteName:[LCSharedUtils appGroupID]];
++    if (!defaults) defaults = NSUserDefaults.standardUserDefaults;
++    NSData *certificate = [defaults objectForKey:@"LCCertificateData"];
++
++    if (![certificate isKindOfClass:NSData.class] || certificate.length == 0 || password.length == 0) {
++        NSLog(@"[InternalRootFS] SIGN FAILED: LiveContainer signing certificate/password is not configured");
++        return false;
++    }
++
++    (void)dlerror();
++    void *zsignHandle = irfs_orig_dlopen("@executable_path/Frameworks/ZSign.dylib", RTLD_NOW | RTLD_GLOBAL);
++    const char *zsignError = dlerror();
++    if (!zsignHandle || (uint64_t)zsignHandle > 0xf00000000000ULL) {
++        NSLog(@"[InternalRootFS] SIGN FAILED: unable to load ZSign.dylib: %s",
++              zsignError ?: "unknown dlopen error");
++        return false;
++    }
++
++    Class signerClass = NSClassFromString(@"ZSigner");
++    SEL selector = NSSelectorFromString(@"signMachOAtPath:bundleId:cert:pass:error:");
++    if (!signerClass || ![signerClass respondsToSelector:selector]) {
++        NSLog(@"[InternalRootFS] SIGN FAILED: synchronous ZSigner bridge is unavailable");
++        return false;
++    }
++
++    NSString *pathString = [NSString stringWithUTF8String:path];
++    NSString *bundleId = NSBundle.mainBundle.bundleIdentifier ?: @"com.kdt.livecontainerInternalTest";
++    NSError *signError = nil;
++
++    typedef BOOL (*IRFSSignMsgSend)(id, SEL, NSString *, NSString *, NSData *, NSString *, NSError **);
++    IRFSSignMsgSend sendSign = (IRFSSignMsgSend)(void *)objc_msgSend;
++
++    NSLog(@"[InternalRootFS] SIGN IN PLACE: %@", pathString);
++    BOOL success = sendSign(signerClass, selector, pathString, bundleId, certificate, password, &signError);
++    if (!success) {
++        NSLog(@"[InternalRootFS] SIGN FAILED: %@", signError.localizedDescription ?: @"unknown ZSign error");
++        return false;
++    }
++
++    NSLog(@"[InternalRootFS] SIGN SUCCESS: %@", pathString);
++    return true;
++}
++
+ // Resolve a dyld-reported dependency into a real path inside the compatibility
+ // root. First try the missing install name itself. If it is @rpath-based, use
+ // the concrete paths dyld printed in "Reason: tried:" -- that lets dyld tell us
+@@ -359,6 +441,7 @@ static bool irfs_preload_from_error_recursive(const char *errorText,
+     NSLog(@"[InternalRootFS] preload: %s", missingPath);
+     NSLog(@"[InternalRootFS]          -> %s", candidate);
+ 
++    BOOL resignAttempted = NO;
+     for (NSUInteger attempt = 0; attempt < 24; attempt++) {
+         (void)dlerror();
+         void *handle = dlopen_nolock(candidate, RTLD_LAZY | RTLD_GLOBAL);
+@@ -377,6 +460,25 @@ static bool irfs_preload_from_error_recursive(const char *errorText,
+         }
+ 
+         NSLog(@"[InternalRootFS] preload child failure: %@", nestedErrorCopy);
++
++        // AppleInternal images from the dump commonly carry signatures that
++        // production AMFI will not accept. Re-sign the on-device RootFS copy
++        // once with LiveContainer's configured developer certificate, then
++        // retry this exact physical image before treating the failure as a
++        // missing child dependency.
++        if (!resignAttempted && irfs_dyld_error_is_signature_failure(nestedErrorCopy.UTF8String)) {
++            resignAttempted = YES;
++            NSLog(@"[InternalRootFS] signature rejection detected for %s", candidate);
++            if (irfs_sign_internal_image_in_place(candidate)) {
++                NSLog(@"[InternalRootFS] retrying preload after in-place signing: %s", candidate);
++                continue;
++            }
++
++            NSLog(@"[InternalRootFS] unable to sign rejected image: %s", candidate);
++            [inProgress removeObject:candidateString];
++            return false;
++        }
++
+         if (!irfs_preload_from_error_recursive(nestedErrorCopy.UTF8String, inProgress, depth + 1)) {
+             NSLog(@"[InternalRootFS] unable to heal child dependency for %s", candidate);
+             [inProgress removeObject:candidateString];
+@@ -446,5 +548,5 @@ void InternalRootFSInit(const char *rootPath) {
+     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, realpath, irfs_realpath, nil);
+     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlopen, irfs_dlopen, nil);
+ 
+-    NSLog(@"[InternalRootFS] enabled read-only compatibility root: %s", gInternalRootFSPath);
++    NSLog(@"[InternalRootFS] enabled guest-read-only compatibility root: %s", gInternalRootFSPath);
+ }
+diff --git a/Resources/ar.lproj/InfoPlist.strings b/Resources/ar.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/ca.lproj/InfoPlist.strings b/Resources/ca.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/cs.lproj/InfoPlist.strings b/Resources/cs.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/da.lproj/InfoPlist.strings b/Resources/da.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/de.lproj/InfoPlist.strings b/Resources/de.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/el.lproj/InfoPlist.strings b/Resources/el.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/en.lproj/InfoPlist.strings b/Resources/en.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/en_AU.lproj/InfoPlist.strings b/Resources/en_AU.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/en_GB.lproj/InfoPlist.strings b/Resources/en_GB.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/es.lproj/InfoPlist.strings b/Resources/es.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/es_419.lproj/InfoPlist.strings b/Resources/es_419.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/fi.lproj/InfoPlist.strings b/Resources/fi.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/fr.lproj/InfoPlist.strings b/Resources/fr.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/fr_CA.lproj/InfoPlist.strings b/Resources/fr_CA.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/he.lproj/InfoPlist.strings b/Resources/he.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/hi.lproj/InfoPlist.strings b/Resources/hi.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/hr.lproj/InfoPlist.strings b/Resources/hr.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/hu.lproj/InfoPlist.strings b/Resources/hu.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/id.lproj/InfoPlist.strings b/Resources/id.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/it.lproj/InfoPlist.strings b/Resources/it.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/ja.lproj/InfoPlist.strings b/Resources/ja.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/ko.lproj/InfoPlist.strings b/Resources/ko.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/ms.lproj/InfoPlist.strings b/Resources/ms.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/nl.lproj/InfoPlist.strings b/Resources/nl.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/no.lproj/InfoPlist.strings b/Resources/no.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/pl.lproj/InfoPlist.strings b/Resources/pl.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/pt_BR.lproj/InfoPlist.strings b/Resources/pt_BR.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/pt_PT.lproj/InfoPlist.strings b/Resources/pt_PT.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/ro.lproj/InfoPlist.strings b/Resources/ro.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/ru.lproj/InfoPlist.strings b/Resources/ru.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/sk.lproj/InfoPlist.strings b/Resources/sk.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/sv.lproj/InfoPlist.strings b/Resources/sv.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/th.lproj/InfoPlist.strings b/Resources/th.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/tr.lproj/InfoPlist.strings b/Resources/tr.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/uk.lproj/InfoPlist.strings b/Resources/uk.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/vi.lproj/InfoPlist.strings b/Resources/vi.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/zh_CN.lproj/InfoPlist.strings b/Resources/zh_CN.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/zh_HK.lproj/InfoPlist.strings b/Resources/zh_HK.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/Resources/zh_TW.lproj/InfoPlist.strings b/Resources/zh_TW.lproj/InfoPlist.strings
+index 29e6f3187646c542e2dc061c80cce145f3f4712b..0ff1ff96e7fdc293f9a2d981197d454bda3d462f 100644
+GIT binary patch
+delta 38
+tcmeYapCBO<FCgiYS(fUYpI4HYnU`ARnOBlpl$V$jl3H9cQB8@_1OWR&4GRDO
+
+delta 24
+fcmWIdoFKs$>yufQ>YSffl9-v7S~Sr_iBSyzX21va
+
+diff --git a/ZSign/zsign.mm b/ZSign/zsign.mm
+index da3e0d2..12259d1 100644
+--- a/ZSign/zsign.mm
++++ b/ZSign/zsign.mm
+@@ -304,6 +304,67 @@ int checkCert(NSData *key,
+     return bRet;
+ }
+ 
++// Synchronous single-image signer used by the AppleInternal RootFS PoC.
++// Unlike the normal app-bundle signing APIs, this intentionally mutates the
++// requested Mach-O in place so the on-device compatibility root can act as a
++// shared signed-image repository without duplicating frameworks per guest.
+++ (BOOL)signMachOAtPath:(NSString *)path bundleId:(NSString *)bundleId cert:(NSData *)key pass:(NSString *)pass error:(NSError **)error {
++    if (!path.length || !bundleId.length || !key.length || !pass.length) {
++        if (error) {
++            *error = [NSError errorWithDomain:@"ZSigner" code:-1 userInfo:@{
++                NSLocalizedDescriptionKey: @"Missing path, bundle identifier, certificate, or certificate password."
++            }];
++        }
++        return NO;
++    }
++
++    ZLog::logs.clear();
++    const char *keyBytes = (const char *)key.bytes;
++    const char *password = [pass cStringUsingEncoding:NSUTF8StringEncoding];
++
++    ZSignAsset signAsset;
++    if (!signAsset.InitSimple(keyBytes, (int)key.length, nil, 0, password)) {
++        if (error) {
++            *error = [NSError errorWithDomain:@"ZSigner" code:-2 userInfo:@{
++                NSLocalizedDescriptionKey: @"Failed to initialize signing certificate. Check the certificate password."
++            }];
++        }
++        return NO;
++    }
++
++    // Break the kernel's cached view of the original AppleInternal signature
++    // before and after writing the replacement signature, matching the normal
++    // LiveContainer signing path's refresh behavior.
++    refreshFile(path);
++
++    ZMachO *macho = new ZMachO();
++    if (!macho->Init(path.UTF8String)) {
++        delete macho;
++        if (error) {
++            *error = [NSError errorWithDomain:@"ZSigner" code:-3 userInfo:@{
++                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Invalid Mach-O: %@", path]
++            }];
++        }
++        return NO;
++    }
++
++    string bundleIdString(bundleId.UTF8String);
++    bool signedOK = macho->Sign(&signAsset, true, bundleIdString, "", "", "");
++    delete macho;
++
++    if (!signedOK) {
++        if (error) {
++            *error = [NSError errorWithDomain:@"ZSigner" code:-4 userInfo:@{
++                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Failed to sign %@", path]
++            }];
++        }
++        return NO;
++    }
++
++    refreshFile(path);
++    return YES;
++}
++
+ // this method is used to get teamId for ADP/Enterprise certs ,don't use it in normal jitless
+ + (NSString*)getTeamIdWithCert:(NSData *)cert pass:(NSString *)pass {
+     string strPassword;
+diff --git a/ZSign/zsigner.h b/ZSign/zsigner.h
+index 5740bfb..072a0dc 100644
+--- a/ZSign/zsigner.h
++++ b/ZSign/zsigner.h
+@@ -10,6 +10,7 @@
+ @interface ZSigner : NSObject
+ + (NSProgress*)signWithAppPath:(NSString *)appPath bundleId:(NSString *)bundleId cert:(NSData *)key pass:(NSString *)pass completionHandler:(void (^)(BOOL success, NSError *error))completionHandler;
+ + (BOOL)adhocSignMachOAtPath:(NSString *)path bundleId:(NSString*)bundleId entitlementData:(NSData *)entitlementData;
+++ (BOOL)signMachOAtPath:(NSString *)path bundleId:(NSString *)bundleId cert:(NSData *)key pass:(NSString *)pass error:(NSError **)error;
+ + (NSProgress*)signMachOPathArr:(NSArray<NSString*>*)machoPathArr bundleId:(NSString *)bundleId cert:(NSData *)key
+                            pass:(NSString *)pass completionHandler:(void(^)(BOOL success, NSError *error))completionHandler;
+ // this method is used to get teamId for ADP/Enterprise certs ,don't use it in normal jitless
+diff --git a/xcconfigs/Global.xcconfig b/xcconfigs/Global.xcconfig
+index 98e35ff..4a7708a 100644
+--- a/xcconfigs/Global.xcconfig
++++ b/xcconfigs/Global.xcconfig
+@@ -13,4 +13,4 @@ DEVELOPMENT_TEAM_SUFFIX[config=Release] =
+ 
+ APP_GROUP_SIDESTORE = group.com.SideStore.SideStore$(DEVELOPMENT_TEAM_SUFFIX)
+ APP_GROUP_ALTSTORE = group.com.rileytestut.AltStore$(DEVELOPMENT_TEAM_SUFFIX)
+-LIVECONTAINER_BUNDLE_IDENTIFIER = com.kdt.livecontainer$(DEVELOPMENT_TEAM_SUFFIX)
++LIVECONTAINER_BUNDLE_IDENTIFIER = com.kdt.livecontainerInternalTest

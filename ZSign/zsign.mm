@@ -304,6 +304,67 @@ int checkCert(NSData *key,
     return bRet;
 }
 
+// Synchronous single-image signer used by the AppleInternal RootFS PoC.
+// Unlike the normal app-bundle signing APIs, this intentionally mutates the
+// requested Mach-O in place so the on-device compatibility root can act as a
+// shared signed-image repository without duplicating frameworks per guest.
++ (BOOL)signMachOAtPath:(NSString *)path bundleId:(NSString *)bundleId cert:(NSData *)key pass:(NSString *)pass error:(NSError **)error {
+    if (!path.length || !bundleId.length || !key.length || !pass.length) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ZSigner" code:-1 userInfo:@{
+                NSLocalizedDescriptionKey: @"Missing path, bundle identifier, certificate, or certificate password."
+            }];
+        }
+        return NO;
+    }
+
+    ZLog::logs.clear();
+    const char *keyBytes = (const char *)key.bytes;
+    const char *password = [pass cStringUsingEncoding:NSUTF8StringEncoding];
+
+    ZSignAsset signAsset;
+    if (!signAsset.InitSimple(keyBytes, (int)key.length, nil, 0, password)) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ZSigner" code:-2 userInfo:@{
+                NSLocalizedDescriptionKey: @"Failed to initialize signing certificate. Check the certificate password."
+            }];
+        }
+        return NO;
+    }
+
+    // Break the kernel's cached view of the original AppleInternal signature
+    // before and after writing the replacement signature, matching the normal
+    // LiveContainer signing path's refresh behavior.
+    refreshFile(path);
+
+    ZMachO *macho = new ZMachO();
+    if (!macho->Init(path.UTF8String)) {
+        delete macho;
+        if (error) {
+            *error = [NSError errorWithDomain:@"ZSigner" code:-3 userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Invalid Mach-O: %@", path]
+            }];
+        }
+        return NO;
+    }
+
+    string bundleIdString(bundleId.UTF8String);
+    bool signedOK = macho->Sign(&signAsset, true, bundleIdString, "", "", "");
+    delete macho;
+
+    if (!signedOK) {
+        if (error) {
+            *error = [NSError errorWithDomain:@"ZSigner" code:-4 userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Failed to sign %@", path]
+            }];
+        }
+        return NO;
+    }
+
+    refreshFile(path);
+    return YES;
+}
+
 // this method is used to get teamId for ADP/Enterprise certs ,don't use it in normal jitless
 + (NSString*)getTeamIdWithCert:(NSData *)cert pass:(NSString *)pass {
     string strPassword;
