@@ -575,7 +575,11 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
         tweakLoaderLoaded = true;
     }
     
-    // Preload executable to bypass RT_NOLOAD
+    // Preload executable to bypass RT_NOLOAD. If AppleInternalRootFS is enabled,
+    // experimentally heal a failed initial dependency by preloading the exact
+    // compatibility-root image dyld reported, then retry the guest. This tests
+    // whether a shared preloaded image can satisfy its original install name
+    // without copying the framework into every guest app.
     appMainImageIndex = _dyld_image_count();
     __block void *appHandle = 0;
     void (^dlopenBlock)(void) = ^{
@@ -584,21 +588,42 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     
     BOOL is27up = false;
     if(@available(iOS 27, *)) { is27up = true; }
-    if(is27up && [guestAppInfo[@"segCountMismatch"] boolValue]) {
-        bypass_seg_count_check(dlopenBlock);
-    } else {
-        dlopenBlock();
+
+    NSString *lastDlopenError = nil;
+    for (NSUInteger preloadAttempt = 0; preloadAttempt < 32; preloadAttempt++) {
+        appHandle = 0;
+        (void)dlerror(); // clear stale error state before each attempt
+
+        if(is27up && [guestAppInfo[@"segCountMismatch"] boolValue]) {
+            bypass_seg_count_check(dlopenBlock);
+        } else {
+            dlopenBlock();
+        }
+
+        const char *attemptError = dlerror();
+        BOOL loadSucceeded = appHandle && (uint64_t)appHandle <= 0xf00000000000ULL;
+        if (loadSucceeded) {
+            if (preloadAttempt > 0) {
+                NSLog(@"[InternalRootFS] guest loaded after %lu preload-heal attempt(s)",
+                      (unsigned long)preloadAttempt);
+            }
+            break;
+        }
+
+        lastDlopenError = attemptError ? [NSString stringWithUTF8String:attemptError] : @"dlopen: an unknown error occurred";
+        if (!InternalRootFSEnabled() || !attemptError ||
+            !InternalRootFSTryPreloadMissingDependency(attemptError)) {
+            break;
+        }
+
+        NSLog(@"[InternalRootFS] retrying guest dlopen after preloading missing dependency (attempt %lu)",
+              (unsigned long)(preloadAttempt + 1));
     }
 
     appExecutableHandle = appHandle;
-    const char *dlerr = dlerror();
     
-    if (!appHandle || (uint64_t)appHandle > 0xf00000000000) {
-        if (dlerr) {
-            appError = @(dlerr);
-        } else {
-            appError = @"dlopen: an unknown error occurred";
-        }
+    if (!appHandle || (uint64_t)appHandle > 0xf00000000000ULL) {
+        appError = lastDlopenError ?: @"dlopen: an unknown error occurred";
         NSLog(@"[LCBootstrap] %@", appError);
         *path = oldPath;
         return appError;
