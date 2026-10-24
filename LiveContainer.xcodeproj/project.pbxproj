@@ -1307,6 +1307,10 @@
 				);
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				LOCALIZED_STRING_SWIFTUI_SUPPORT = NO;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@loader_path",
+				);
 				MACOSX_DEPLOYMENT_TARGET = 15.2;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
@@ -1332,6 +1336,10 @@
 				);
 				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
 				LOCALIZED_STRING_SWIFTUI_SUPPORT = NO;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@loader_path",
+				);
 				MACOSX_DEPLOYMENT_TARGET = 15.2;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = iphoneos;
