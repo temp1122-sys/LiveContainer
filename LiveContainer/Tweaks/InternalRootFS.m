@@ -74,6 +74,8 @@ static bool irfs_overlay_candidate(const char *path) {
            irfs_has_prefix(path, "/Library") ||
            irfs_has_prefix(path, "/Applications") ||
            irfs_has_prefix(path, "/usr/local") ||
+           irfs_has_prefix(path, "/usr/bin") ||
+           irfs_has_prefix(path, "/bin") ||
            irfs_has_prefix(path, "/etc") ||
            irfs_has_prefix(path, "/private/etc");
 }
@@ -280,6 +282,8 @@ static bool irfs_path_is_mutable_internal_image(const char *path) {
     char appleInternalRoot[PATH_MAX];
     char developerRoot[PATH_MAX];
     char usrLocalRoot[PATH_MAX];
+    char usrBinRoot[PATH_MAX];
+    char binRoot[PATH_MAX];
 
     snprintf(appleInternalRoot,
              sizeof(appleInternalRoot),
@@ -296,9 +300,21 @@ static bool irfs_path_is_mutable_internal_image(const char *path) {
              "%s/usr/local",
              gInternalRootFSPath);
 
+    snprintf(usrBinRoot,
+             sizeof(usrBinRoot),
+             "%s/usr/bin",
+             gInternalRootFSPath);
+
+    snprintf(binRoot,
+             sizeof(binRoot),
+             "%s/bin",
+             gInternalRootFSPath);
+
     return irfs_has_prefix(path, appleInternalRoot) ||
            irfs_has_prefix(path, developerRoot) ||
-           irfs_has_prefix(path, usrLocalRoot);
+           irfs_has_prefix(path, usrLocalRoot) ||
+           irfs_has_prefix(path, usrBinRoot) ||
+           irfs_has_prefix(path, binRoot);
 }
 
 static bool irfs_dyld_error_is_signature_failure(const char *errorText) {
