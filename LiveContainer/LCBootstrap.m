@@ -580,7 +580,6 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     // compatibility-root image dyld reported, then retry the guest. This tests
     // whether a shared preloaded image can satisfy its original install name
     // without copying the framework into every guest app.
-    appMainImageIndex = _dyld_image_count();
     __block void *appHandle = 0;
     void (^dlopenBlock)(void) = ^{
         appHandle = dlopen_nolock(appExecPath, RTLD_LAZY|RTLD_GLOBAL|RTLD_FIRST);
@@ -593,6 +592,14 @@ static NSString* invokeAppMain(NSString *selectedApp, NSString *selectedContaine
     for (NSUInteger preloadAttempt = 0; preloadAttempt < 32; preloadAttempt++) {
         appHandle = 0;
         (void)dlerror(); // clear stale error state before each attempt
+
+        // The AppleInternal healing path may have loaded one or more frameworks
+        // since the previous guest attempt. LiveContainer expects the guest
+        // executable to occupy the next dyld image slot, so refresh the index
+        // immediately before every retry rather than keeping the original
+        // pre-heal snapshot.
+        appMainImageIndex = _dyld_image_count();
+        NSLog(@"[InternalRootFS] guest dlopen expects image index %u", appMainImageIndex);
 
         if(is27up && [guestAppInfo[@"segCountMismatch"] boolValue]) {
             bypass_seg_count_check(dlopenBlock);
