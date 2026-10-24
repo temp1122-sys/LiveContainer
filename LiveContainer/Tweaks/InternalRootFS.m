@@ -12,6 +12,7 @@
 
 #import "Tweaks.h"
 #import "../LCSharedUtils.h"
+#import "../utils.h"
 #include "../../litehook/src/litehook.h"
 
 #include <dirent.h>
@@ -299,12 +300,26 @@ static bool irfs_sign_internal_image_in_place(const char *path) {
         return false;
     }
 
+    // NSBundle.mainBundle is intentionally replaced with the guest bundle by
+    // LiveContainer before we get here. Likewise, @executable_path may resolve
+    // relative to the guest executable (e.g. Siri Debug), which would make dyld
+    // look for ZSign.dylib inside Guest.app/Frameworks. LiveContainer preserves
+    // its original host bundle in NSUserDefaults.lcMainBundle; use that absolute
+    // path instead.
+    NSBundle *hostBundle = NSUserDefaults.lcMainBundle;
+    NSString *zsignPath = [hostBundle.bundlePath stringByAppendingPathComponent:@"Frameworks/ZSign.dylib"];
+    if (!hostBundle || zsignPath.length == 0) {
+        NSLog(@"[InternalRootFS] SIGN FAILED: LiveContainer host bundle is unavailable");
+        return false;
+    }
+
+    NSLog(@"[InternalRootFS] host ZSign path: %@", zsignPath);
     (void)dlerror();
-    void *zsignHandle = irfs_orig_dlopen("@executable_path/Frameworks/ZSign.dylib", RTLD_NOW | RTLD_GLOBAL);
+    void *zsignHandle = irfs_orig_dlopen(zsignPath.fileSystemRepresentation, RTLD_NOW | RTLD_GLOBAL);
     const char *zsignError = dlerror();
     if (!zsignHandle || (uint64_t)zsignHandle > 0xf00000000000ULL) {
-        NSLog(@"[InternalRootFS] SIGN FAILED: unable to load ZSign.dylib: %s",
-              zsignError ?: "unknown dlopen error");
+        NSLog(@"[InternalRootFS] SIGN FAILED: unable to load ZSign.dylib at %@: %s",
+              zsignPath, zsignError ?: "unknown dlopen error");
         return false;
     }
 
@@ -316,7 +331,7 @@ static bool irfs_sign_internal_image_in_place(const char *path) {
     }
 
     NSString *pathString = [NSString stringWithUTF8String:path];
-    NSString *bundleId = NSBundle.mainBundle.bundleIdentifier ?: @"com.kdt.livecontainerInternalTest";
+    NSString *bundleId = hostBundle.bundleIdentifier ?: @"com.kdt.livecontainerInternalTest";
     NSError *signError = nil;
 
     typedef BOOL (*IRFSSignMsgSend)(id, SEL, NSString *, NSString *, NSData *, NSString *, NSError **);
