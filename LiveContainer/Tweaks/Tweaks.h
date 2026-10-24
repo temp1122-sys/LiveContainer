@@ -20,6 +20,8 @@ void IDFVHookInit(NSUUID* uuid);
 void InternalRootFSInit(const char *rootPath);
 bool InternalRootFSEnabled(void);
 const char *InternalRootFSTranslatePath(const char *path, char *buffer, size_t bufferSize);
+// Experimental dyld failure healer: preload a missing dependency from the compatibility root.
+bool InternalRootFSTryPreloadMissingDependency(const char *dyldError);
 
 @interface NSBundle(LiveContainer)
 - (instancetype)initWithPathForMainBundle:(NSString *)path;

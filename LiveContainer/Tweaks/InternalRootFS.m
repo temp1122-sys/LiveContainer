@@ -94,10 +94,6 @@ const char *InternalRootFSTranslatePath(const char *path, char *buffer, size_t b
     if (!force && !overlay) {
         return path;
     }
-    
-    if (gInternalRootFSLogCount < 250) {
-        NSLog(@"[InternalRootFS] lookup: %s", path);
-    }
 
     // /etc on iOS resolves into /private/etc. Preserve the on-disk root layout
     // when looking inside an extracted filesystem image.
@@ -217,59 +213,187 @@ static char *irfs_realpath(const char *path, char *resolvedPath) {
     return irfs_orig_realpath(InternalRootFSTranslatePath(path, translated, sizeof(translated)), resolvedPath);
 }
 
-static void irfs_self_test(void) {
-    NSLog(@"[InternalRootFS] ===== self-test =====");
-    NSLog(@"[InternalRootFS] root = %s", gInternalRootFSPath);
-
-    const char *testVirtualPath =
-        "/AppleInternal/Library/Frameworks/"
-        "CoreAutomationDevice.framework/CoreAutomationDevice";
-
-    char translated[PATH_MAX];
-    const char *resolved = InternalRootFSTranslatePath(
-        testVirtualPath,
-        translated,
-        sizeof(translated)
-    );
-
-    NSLog(@"[InternalRootFS] virtual path = %s", testVirtualPath);
-    NSLog(@"[InternalRootFS] resolved path = %s", resolved);
-
-    struct stat st;
-    int rc = irfs_orig_stat(resolved, &st);
-
-    if (rc == 0) {
-        NSLog(@"[InternalRootFS] SELF-TEST HIT");
-        NSLog(@"[InternalRootFS] size = %lld", (long long)st.st_size);
-        NSLog(@"[InternalRootFS] mode = %o", st.st_mode);
-    } else {
-        NSLog(@"[InternalRootFS] SELF-TEST MISS errno=%d (%s)",
-              errno, strerror(errno));
-    }
-
-    NSLog(@"[InternalRootFS] ===================");
-}
-
-/* static void *irfs_dlopen(const char *path, int mode) {
+static void *irfs_dlopen(const char *path, int mode) {
     char translated[PATH_MAX];
     const char *resolved = InternalRootFSTranslatePath(path, translated, sizeof(translated));
     return irfs_orig_dlopen(resolved, mode);
-} */
+}
 
-static void *irfs_dlopen(const char *path, int mode) {
-    NSLog(@"[InternalRootFS] dlopen request: %s",
-          path ? path : "(null)");
 
-    char translated[PATH_MAX];
-    const char *resolved =
-        InternalRootFSTranslatePath(path, translated, sizeof(translated));
+#pragma mark - Experimental pre-dyld dependency preload healer
 
-    if (path && resolved && strcmp(path, resolved) != 0) {
-        NSLog(@"[InternalRootFS] dlopen translated: %s -> %s",
-              path, resolved);
+// Pull the value following a label such as "Library not loaded: " up to the
+// next newline. dyld error strings are intentionally treated as diagnostics,
+// not a stable API; this is a PoC and logs loudly when parsing fails.
+static bool irfs_extract_error_field(const char *errorText, const char *label,
+                                     char *out, size_t outSize) {
+    if (!errorText || !label || !out || outSize == 0) return false;
+    const char *start = strstr(errorText, label);
+    if (!start) return false;
+    start += strlen(label);
+    while (*start == ' ' || *start == '\t') start++;
+
+    const char *end = start;
+    while (*end && *end != '\n' && *end != '\r') end++;
+    while (end > start && (end[-1] == ' ' || end[-1] == '\t')) end--;
+    if (end <= start) return false;
+
+    size_t len = (size_t)(end - start);
+    if (len >= outSize) len = outSize - 1;
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return true;
+}
+
+static bool irfs_preloadable_file_exists(const char *path) {
+    if (!path || !path[0]) return false;
+    struct stat st;
+    return irfs_orig_stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+// Resolve a dyld-reported dependency into a real path inside the compatibility
+// root. First try the missing install name itself. If it is @rpath-based, use
+// the concrete paths dyld printed in "Reason: tried:" -- that lets dyld tell us
+// which LC_RPATH expansions it actually attempted rather than reimplementing
+// its runpath rules here.
+static bool irfs_resolve_dyld_error_candidate(const char *errorText,
+                                              const char *missingPath,
+                                              char *out, size_t outSize) {
+    if (!errorText || !missingPath || !out || outSize == 0) return false;
+
+    if (missingPath[0] == '/') {
+        char translated[PATH_MAX];
+        const char *candidate = InternalRootFSTranslatePath(missingPath, translated, sizeof(translated));
+        if (candidate && irfs_preloadable_file_exists(candidate) && strcmp(candidate, missingPath) != 0) {
+            strlcpy(out, candidate, outSize);
+            return true;
+        }
     }
 
-    return irfs_orig_dlopen(resolved, mode);
+    // Modern dyld errors quote every concrete attempted path. Find the first
+    // one that our overlay can translate to an existing file in the dump.
+    const char *cursor = errorText;
+    while ((cursor = strchr(cursor, '\'')) != NULL) {
+        const char *end = strchr(cursor + 1, '\'');
+        if (!end) break;
+
+        size_t len = (size_t)(end - (cursor + 1));
+        if (len > 0 && len < PATH_MAX) {
+            char attempted[PATH_MAX];
+            memcpy(attempted, cursor + 1, len);
+            attempted[len] = '\0';
+
+            if (attempted[0] == '/') {
+                char translated[PATH_MAX];
+                const char *candidate = InternalRootFSTranslatePath(attempted, translated, sizeof(translated));
+                if (candidate && strcmp(candidate, attempted) != 0 && irfs_preloadable_file_exists(candidate)) {
+                    strlcpy(out, candidate, outSize);
+                    return true;
+                }
+                // Also accept a path already inside our compatibility root.
+                if (irfs_has_prefix(attempted, gInternalRootFSPath) && irfs_preloadable_file_exists(attempted)) {
+                    strlcpy(out, attempted, outSize);
+                    return true;
+                }
+            }
+        }
+        cursor = end + 1;
+    }
+
+    // Last-resort canonical locations for @rpath dependencies. This is not
+    // intended to replace the real resolver; it merely makes the preload PoC
+    // useful when dyld's error omits a helpful AppleInternal/Developer attempt.
+    if (!strncmp(missingPath, "@rpath/", 7)) {
+        const char *suffix = missingPath + 7;
+        const char *roots[] = {
+            "/AppleInternal/Library/Frameworks",
+            "/AppleInternal/Library/PrivateFrameworks",
+            "/Developer/Library/Frameworks",
+            "/Developer/Library/PrivateFrameworks",
+            "/AppleInternal/Developer/Library/Frameworks",
+            "/AppleInternal/Developer/Library/PrivateFrameworks",
+            "/AppleInternal/Developer/usr/lib",
+            "/Developer/usr/lib",
+            "/usr/local/lib",
+            NULL
+        };
+        for (size_t i = 0; roots[i]; i++) {
+            char virtualPath[PATH_MAX];
+            snprintf(virtualPath, sizeof(virtualPath), "%s/%s", roots[i], suffix);
+            char translated[PATH_MAX];
+            const char *candidate = InternalRootFSTranslatePath(virtualPath, translated, sizeof(translated));
+            if (candidate && strcmp(candidate, virtualPath) != 0 && irfs_preloadable_file_exists(candidate)) {
+                strlcpy(out, candidate, outSize);
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+static bool irfs_preload_from_error_recursive(const char *errorText,
+                                              NSMutableSet<NSString *> *inProgress,
+                                              NSUInteger depth) {
+    if (!gInternalRootFSEnabled || !errorText || depth > 24) return false;
+
+    char missingPath[PATH_MAX];
+    if (!irfs_extract_error_field(errorText, "Library not loaded: ", missingPath, sizeof(missingPath))) {
+        NSLog(@"[InternalRootFS] preload: could not parse missing dependency from dyld error");
+        return false;
+    }
+
+    char candidate[PATH_MAX];
+    if (!irfs_resolve_dyld_error_candidate(errorText, missingPath, candidate, sizeof(candidate))) {
+        NSLog(@"[InternalRootFS] preload: no compatibility-root candidate for %s", missingPath);
+        return false;
+    }
+
+    NSString *candidateString = [NSString stringWithUTF8String:candidate];
+    if (!candidateString.length || [inProgress containsObject:candidateString]) {
+        NSLog(@"[InternalRootFS] preload: dependency cycle/duplicate while loading %s", candidate);
+        return false;
+    }
+
+    [inProgress addObject:candidateString];
+    NSLog(@"[InternalRootFS] preload: %s", missingPath);
+    NSLog(@"[InternalRootFS]          -> %s", candidate);
+
+    for (NSUInteger attempt = 0; attempt < 24; attempt++) {
+        (void)dlerror();
+        void *handle = dlopen_nolock(candidate, RTLD_LAZY | RTLD_GLOBAL);
+        const char *nestedError = dlerror();
+        if (handle && (uint64_t)handle <= 0xf00000000000ULL) {
+            NSLog(@"[InternalRootFS] PRELOAD SUCCESS: %s (%p)", candidate, handle);
+            [inProgress removeObject:candidateString];
+            return true;
+        }
+
+        NSString *nestedErrorCopy = nestedError ? [NSString stringWithUTF8String:nestedError] : nil;
+        if (!nestedErrorCopy.length) {
+            NSLog(@"[InternalRootFS] PRELOAD FAILED without dyld error: %s", candidate);
+            [inProgress removeObject:candidateString];
+            return false;
+        }
+
+        NSLog(@"[InternalRootFS] preload child failure: %@", nestedErrorCopy);
+        if (!irfs_preload_from_error_recursive(nestedErrorCopy.UTF8String, inProgress, depth + 1)) {
+            NSLog(@"[InternalRootFS] unable to heal child dependency for %s", candidate);
+            [inProgress removeObject:candidateString];
+            return false;
+        }
+        NSLog(@"[InternalRootFS] retrying preload after child dependency was loaded: %s", candidate);
+    }
+
+    NSLog(@"[InternalRootFS] preload retry limit reached: %s", candidate);
+    [inProgress removeObject:candidateString];
+    return false;
+}
+
+bool InternalRootFSTryPreloadMissingDependency(const char *dyldError) {
+    if (!gInternalRootFSEnabled || !dyldError) return false;
+    NSMutableSet<NSString *> *inProgress = [NSMutableSet set];
+    return irfs_preload_from_error_recursive(dyldError, inProgress, 0);
 }
 
 void InternalRootFSInit(const char *rootPath) {
@@ -323,5 +447,4 @@ void InternalRootFSInit(const char *rootPath) {
     litehook_rebind_symbol(LITEHOOK_REBIND_GLOBAL, dlopen, irfs_dlopen, nil);
 
     NSLog(@"[InternalRootFS] enabled read-only compatibility root: %s", gInternalRootFSPath);
-    irfs_self_test();
 }
