@@ -464,6 +464,109 @@ static bool irfs_resolve_dyld_error_candidate(const char *errorText,
     return false;
 }
 
+static bool irfs_find_rootfs_tried_path_for_rpath(const char *errorText,
+                                                   const char *missingPath,
+                                                   char *out, size_t outSize) {
+    if (!errorText || !missingPath || !out || outSize == 0 ||
+        strncmp(missingPath, "@rpath/", 7) != 0) {
+        return false;
+    }
+
+    // For a dependency loaded from the compatibility root, dyld often expands
+    // @loader_path/Frameworks (or a similar LC_RPATH) to a *physical* path
+    // inside AppleInternalRootFS. That path is ideal for a tiny symlink bridge:
+    // dyld can then resolve the @rpath normally without duplicating the image.
+    const char *cursor = errorText;
+    while ((cursor = strchr(cursor, '\'')) != NULL) {
+        const char *end = strchr(cursor + 1, '\'');
+        if (!end) break;
+
+        size_t len = (size_t)(end - (cursor + 1));
+        if (len > 0 && len < PATH_MAX) {
+            char attempted[PATH_MAX];
+            memcpy(attempted, cursor + 1, len);
+            attempted[len] = '\0';
+
+            if (attempted[0] == '/' && irfs_has_prefix(attempted, gInternalRootFSPath)) {
+                struct stat st;
+                if (irfs_orig_lstat(attempted, &st) != 0 && errno == ENOENT) {
+                    strlcpy(out, attempted, outSize);
+                    return true;
+                }
+            }
+        }
+        cursor = end + 1;
+    }
+
+    return false;
+}
+
+static bool irfs_mkdir_parents_for_file(const char *path) {
+    if (!path || !gInternalRootFSPath[0] || !irfs_has_prefix(path, gInternalRootFSPath)) {
+        return false;
+    }
+
+    char parent[PATH_MAX];
+    strlcpy(parent, path, sizeof(parent));
+    char *lastSlash = strrchr(parent, '/');
+    if (!lastSlash || lastSlash == parent) return false;
+    *lastSlash = '\0';
+
+    size_t rootLen = strlen(gInternalRootFSPath);
+    if (strlen(parent) <= rootLen) return true;
+
+    for (char *p = parent + rootLen + 1; *p; p++) {
+        if (*p != '/') continue;
+        *p = '\0';
+        if (mkdir(parent, 0755) != 0 && errno != EEXIST) {
+            *p = '/';
+            return false;
+        }
+        *p = '/';
+    }
+
+    return mkdir(parent, 0755) == 0 || errno == EEXIST;
+}
+
+static bool irfs_create_rpath_bridge(const char *errorText,
+                                     const char *missingPath,
+                                     const char *candidate) {
+    if (!errorText || !missingPath || !candidate ||
+        strncmp(missingPath, "@rpath/", 7) != 0 ||
+        !irfs_has_prefix(candidate, gInternalRootFSPath)) {
+        return false;
+    }
+
+    char bridgePath[PATH_MAX];
+    if (!irfs_find_rootfs_tried_path_for_rpath(errorText, missingPath,
+                                               bridgePath, sizeof(bridgePath))) {
+        return false;
+    }
+
+    if (!irfs_mkdir_parents_for_file(bridgePath)) {
+        NSLog(@"[InternalRootFS] RPATH BRIDGE mkdir failed: %s (%s)",
+              bridgePath, strerror(errno));
+        return false;
+    }
+
+    // Never replace a real file or an existing symlink. The compatibility root
+    // is allowed to be mutated, but bridge creation should remain additive.
+    struct stat existing;
+    if (irfs_orig_lstat(bridgePath, &existing) == 0) {
+        NSLog(@"[InternalRootFS] RPATH BRIDGE already exists: %s", bridgePath);
+        return true;
+    }
+
+    if (symlink(candidate, bridgePath) != 0) {
+        NSLog(@"[InternalRootFS] RPATH BRIDGE failed: %s -> %s (%s)",
+              bridgePath, candidate, strerror(errno));
+        return false;
+    }
+
+    NSLog(@"[InternalRootFS] RPATH BRIDGE: %s -> %s", bridgePath, candidate);
+    return true;
+}
+
 static bool irfs_preload_from_error_recursive(const char *errorText,
                                               NSMutableSet<NSString *> *inProgress,
                                               NSUInteger depth) {
@@ -492,12 +595,25 @@ static bool irfs_preload_from_error_recursive(const char *errorText,
     NSLog(@"[InternalRootFS]          -> %s", candidate);
 
     BOOL resignAttempted = NO;
+    NSString *lastMissingDependency = nil;
+    NSUInteger repeatedMissingDependencyCount = 0;
     for (NSUInteger attempt = 0; attempt < 24; attempt++) {
         (void)dlerror();
         void *handle = dlopen_nolock(candidate, RTLD_LAZY | RTLD_GLOBAL);
         const char *nestedError = dlerror();
         if (handle && (uint64_t)handle <= 0xf00000000000ULL) {
             NSLog(@"[InternalRootFS] PRELOAD SUCCESS: %s (%p)", candidate, handle);
+
+            // Preloading is enough for many absolute install names, but dyld
+            // may continue insisting on a concrete LC_RPATH location for an
+            // @rpath dependency. If dyld showed us a missing path *inside* the
+            // compatibility root, create a symlink there to this canonical
+            // shared image. This costs essentially no storage and lets the
+            // parent retry use normal dyld resolution.
+            if (!strncmp(missingPath, "@rpath/", 7)) {
+                (void)irfs_create_rpath_bridge(errorText, missingPath, candidate);
+            }
+
             [inProgress removeObject:candidateString];
             return true;
         }
@@ -510,6 +626,30 @@ static bool irfs_preload_from_error_recursive(const char *errorText,
         }
 
         NSLog(@"[InternalRootFS] preload child failure: %@", nestedErrorCopy);
+
+        // Avoid spinning 24 times when a successfully-preloaded image still
+        // does not satisfy the exact same @rpath request. The bridge path above
+        // should fix that case; if the same parent reports the same child three
+        // times, stop and leave a useful diagnostic instead of flooding Console.
+        char nestedMissingPath[PATH_MAX];
+        if (irfs_extract_error_field(nestedErrorCopy.UTF8String,
+                                     "Library not loaded: ",
+                                     nestedMissingPath, sizeof(nestedMissingPath))) {
+            NSString *nestedMissing = [NSString stringWithUTF8String:nestedMissingPath];
+            if ([nestedMissing isEqualToString:lastMissingDependency]) {
+                repeatedMissingDependencyCount++;
+            } else {
+                lastMissingDependency = nestedMissing;
+                repeatedMissingDependencyCount = 1;
+            }
+
+            if (repeatedMissingDependencyCount >= 3) {
+                NSLog(@"[InternalRootFS] same child dependency is still unresolved after %lu attempts: %s (parent %s)",
+                      (unsigned long)repeatedMissingDependencyCount, nestedMissingPath, candidate);
+                [inProgress removeObject:candidateString];
+                return false;
+            }
+        }
 
         // AppleInternal images from the dump commonly carry signatures that
         // production AMFI will not accept. Re-sign the on-device RootFS copy
